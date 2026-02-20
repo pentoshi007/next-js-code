@@ -186,23 +186,42 @@ sequenceDiagram
 
 ```typescript
 // lib/db.ts
+
+// mongoose is the ODM (Object Data Modeling) library that lets us
+// interact with MongoDB using JavaScript objects instead of raw queries.
 import mongoose from "mongoose";
 
+// "async" because connecting to a remote database is an I/O operation
+// that takes time — we don't want to block the server while waiting.
 async function connectDB() {
   try {
-    // Guard: Avoid duplicate connections during HMR
+    // 🛡️ CONNECTION GUARD — the most important line in this file.
+    // mongoose.connection.readyState returns a number:
+    //   0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
+    // If we're already connected (1), skip — don't open another connection.
+    // Without this check, Next.js hot-reload would open a new connection
+    // every time you save a file during development.
     if (mongoose.connection.readyState === 1) {
       console.log("Already connected to MongoDB");
-      return;
+      return; // Early return — nothing more to do
     }
+
+    // process.env.MONGODB_URI reads the connection string from the .env file.
+    // The "|| ''" fallback prevents TypeScript from complaining about
+    // a possibly undefined value. If .env is missing, mongoose.connect("")
+    // will throw a clear connection error instead of a cryptic undefined error.
     await mongoose.connect(process.env.MONGODB_URI || "");
     console.log("Connected to MongoDB");
   } catch (error) {
     console.error("Error connecting to MongoDB", error);
-    throw error; // Let the caller handle the error
+    // We throw the error (not silently swallow it) so the caller
+    // (route handler or page) knows the DB is unreachable and can
+    // return a proper 500 error to the user.
+    throw error;
   }
 }
 
+// Default export — so other files can import with: import connectDB from "../lib/db"
 export default connectDB;
 ```
 
@@ -229,24 +248,41 @@ By checking for `readyState === 1`, we short-circuit if already connected.
 // models/Note.ts
 import mongoose from "mongoose";
 
+// TypeScript interface — defines the SHAPE of a Note document.
+// This gives us autocomplete and type-checking everywhere we use a Note.
 interface INote {
   title: string;
   content: string;
-  createdAt: Date;
-  updatedAt: Date;
+  createdAt: Date; // Will be auto-managed by Mongoose (see timestamps below)
+  updatedAt: Date; // Will be auto-managed by Mongoose (see timestamps below)
 }
 
+// A Mongoose Schema is like a blueprint. It tells MongoDB:
+//   "Every document in the 'notes' collection must look like this."
+// The <INote> generic links the schema to our TypeScript interface.
 const noteSchema = new mongoose.Schema<INote>(
   {
+    // Each field has a 'type' and optional validators:
+    // - 'required: true' → Mongoose rejects .create() if field is missing
+    // - 'maxLength: 100' → Mongoose rejects if string exceeds 100 chars
     title: { type: String, required: true, maxLength: 100 },
     content: { type: String, required: true, maxLength: 2000 },
+    // Note: we don't define createdAt/updatedAt here — 'timestamps' handles it.
   },
   {
-    timestamps: true, // Auto-adds createdAt & updatedAt
+    // timestamps: true tells Mongoose to automatically:
+    //   1. Add a 'createdAt' field set to Date.now() when a doc is first saved
+    //   2. Add an 'updatedAt' field that gets refreshed on every .save() or .update()
+    // You never need to manually manage these fields.
+    timestamps: true,
   },
 );
 
-// The critical pattern for Next.js + Mongoose:
+// ⚠️ THE CRITICAL PATTERN FOR NEXT.JS + MONGOOSE:
+// mongoose.models.Note — checks if a model named "Note" was already registered.
+// If YES → reuse it (prevents the HMR "OverwriteModelError" crash).
+// If NO  → register it now with mongoose.model<INote>("Note", noteSchema).
+// The "||" (logical OR) makes this a one-liner: use existing OR create new.
 const Note = mongoose.models.Note || mongoose.model<INote>("Note", noteSchema);
 
 export default Note;
@@ -281,17 +317,38 @@ Without this guard, every HMR reload would attempt to call `mongoose.model("Note
 
 ```typescript
 // app/api/notes/route.ts
+
+// NextRequest  — the incoming HTTP request object (URL, headers, body, etc.)
+// NextResponse — helper to build HTTP responses (sets headers, status codes, etc.)
 import { NextRequest, NextResponse } from "next/server";
 import connectDB from "../../../lib/db";
 import Note from "../../../models/Note";
 
+// ─────────────────────────────────────────────────────
 // GET /api/notes — Fetch all notes
+// ─────────────────────────────────────────────────────
+// By exporting a function named "GET", Next.js automatically routes
+// all GET requests to /api/notes into this function. No router setup needed.
 export async function GET(request: NextRequest) {
   try {
+    // Step 1: Ensure we have a live MongoDB connection.
     await connectDB();
-    const notes = await Note.find().sort({ createdAt: -1 }); // Newest first
+
+    // Step 2: Query the database.
+    // Note.find()              → returns ALL documents in the "notes" collection
+    // .sort({ createdAt: -1 }) → sort by createdAt in DESCENDING order
+    //                            (-1 = newest first, 1 = oldest first)
+    const notes = await Note.find().sort({ createdAt: -1 });
+
+    // Step 3: Return a JSON response.
+    // NextResponse.json() automatically sets Content-Type: application/json.
+    // The second argument { status: 200 } sets the HTTP status code.
+    // We include { success: true } so the frontend can easily check if the
+    // request worked (instead of just checking the status code).
     return NextResponse.json({ success: true, notes }, { status: 200 });
   } catch (error) {
+    // If anything goes wrong (DB down, query error), return a 500 error.
+    // 500 = Internal Server Error — tells the client "it's our fault, not yours."
     return NextResponse.json(
       { error: "Failed to fetch notes" },
       { status: 500 },
@@ -299,12 +356,30 @@ export async function GET(request: NextRequest) {
   }
 }
 
+// ─────────────────────────────────────────────────────
 // POST /api/notes — Create a new note
+// ─────────────────────────────────────────────────────
+// Same file, different exported function name → handles POST requests.
 export async function POST(request: NextRequest) {
   try {
-    const { title, content } = await request.json(); // Parse request body
+    // Step 1: Parse the JSON body sent by the frontend.
+    // Unlike Express (where body is pre-parsed by middleware),
+    // Next.js requires you to manually await request.json().
+    // Destructuring { title, content } pulls out only the fields we need.
+    const { title, content } = await request.json();
+
+    // Step 2: Connect to the database.
     await connectDB();
+
+    // Step 3: Create a new document in MongoDB.
+    // Note.create() validates against the schema (required, maxLength)
+    // and then inserts the document. It returns the saved document
+    // (including the auto-generated _id, createdAt, updatedAt).
     const note = await Note.create({ title, content });
+
+    // Step 4: Return the created note with status 201.
+    // 201 = Created — REST best practice for successful resource creation.
+    // (200 = OK is for general success, 201 specifically means "new resource made")
     return NextResponse.json({ success: true, note }, { status: 201 });
   } catch (error) {
     return NextResponse.json(
@@ -337,26 +412,53 @@ This is cleaner than `const body = await request.json(); const title = body.titl
 
 ```typescript
 // app/api/notes/[id]/route.ts
+//
+// This file lives inside a [id] folder. The square brackets tell Next.js:
+// "This is a DYNAMIC route — the 'id' part of the URL can be anything."
+// Example: /api/notes/abc123 → id = "abc123"
+//          /api/notes/xyz789 → id = "xyz789"
+
 import { NextRequest, NextResponse } from "next/server";
 import connectDB from "../../../../lib/db";
 import Note from "../../../../models/Note";
 
-// PATCH /api/notes/:id — Update a note
+// ─────────────────────────────────────────────────────
+// PATCH /api/notes/:id — Update a specific note
+// ─────────────────────────────────────────────────────
+// Route handlers for dynamic routes receive a SECOND argument
+// containing the URL parameters (in addition to the request).
 export async function PATCH(
   request: NextRequest,
+  // In Next.js 15+, params is a PROMISE, not a plain object.
+  // Type: { params: Promise<{ id: string }> }
+  // The { id: string } shape comes from the folder name [id].
+  // If the folder was [slug], the type would be { slug: string }.
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { id } = await params; // ⚠️ params is a Promise in Next.js 15+
+    // ⚠️ MUST await params — this is a Next.js 15+ breaking change.
+    // In Next.js 14, params was a plain object (no await needed).
+    const { id } = await params;
+
+    // Parse the updated title and content from the request body.
     const { title, content } = await request.json();
 
     await connectDB();
+
+    // findByIdAndUpdate(id, updateData, options):
+    //   - id: the MongoDB _id to find
+    //   - { title, content }: the fields to update
+    //   - { returnDocument: "after" }: return the document AFTER the update
+    //     (default is "before", which returns the OLD version — usually not useful)
+    //     Note: this is equivalent to the older { new: true } option.
     const note = await Note.findByIdAndUpdate(
       id,
       { title, content },
-      { returnDocument: "after" }, // Return the UPDATED document
+      { returnDocument: "after" },
     );
 
+    // Mongoose returns null if no document matched the id.
+    // We must handle this ourselves — Mongoose does NOT auto-throw.
     if (!note) {
       return NextResponse.json({ error: "Note not found" }, { status: 404 });
     }
@@ -370,21 +472,31 @@ export async function PATCH(
   }
 }
 
-// DELETE /api/notes/:id — Delete a note
+// ─────────────────────────────────────────────────────
+// DELETE /api/notes/:id — Delete a specific note
+// ─────────────────────────────────────────────────────
 export async function DELETE(
   request: NextRequest,
+  // Same params pattern as PATCH — dynamic [id] from URL.
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
     const { id } = await params;
 
     await connectDB();
+
+    // findByIdAndDelete(id):
+    //   - Finds a document with this _id and removes it from the collection.
+    //   - Returns the deleted document (or null if not found).
+    //   - This is a single atomic operation (find + delete in one query).
     const note = await Note.findByIdAndDelete(id);
 
+    // If no document was found with this id, return 404.
     if (!note) {
       return NextResponse.json({ error: "Note not found" }, { status: 404 });
     }
 
+    // No note data to return on delete — just a success message.
     return NextResponse.json(
       { success: true, message: "Note deleted successfully" },
       { status: 200 },
@@ -422,15 +534,34 @@ export async function DELETE(
 
 ```tsx
 // app/page.tsx
+//
+// This is a SERVER COMPONENT (the default in Next.js App Router).
+// It runs on the server, NOT in the browser. This means:
+//   ✅ Can directly access databases, file systems, env vars
+//   ✅ Can be an async function (server components support async/await)
+//   ❌ Cannot use useState, useEffect, onClick, or any browser APIs
+
 import connectDB from "../lib/db";
 import NotesClient from "../components/NotesClient";
 import ToasterProvider from "../components/ToasterProvider";
 
+// Notice: the function is "async" — this is ONLY possible in Server Components.
+// Client Components cannot be async.
 export default async function Home() {
-  await connectDB(); // Runs on the server during SSR
+  // This runs on the server during SSR (Server-Side Rendering).
+  // It "warms up" the MongoDB connection so it's ready when
+  // the client component makes its first API call (/api/notes).
+  await connectDB();
+
   return (
+    // React Fragment (<>...</>) lets us return multiple elements
+    // without adding an extra <div> wrapper to the DOM.
     <>
+      {/* ToasterProvider is a Client Component that renders the
+          toast notification container. It must be rendered at the
+          top level so toasts appear above all other content. */}
       <ToasterProvider />
+
       <div className="min-h-screen bg-gray-50">
         <div className="container mx-auto px-4 py-8">
           <div className="mb-8">
@@ -439,6 +570,11 @@ export default async function Home() {
               Create, manage and organize your notes
             </p>
           </div>
+
+          {/* NotesClient is a Client Component ("use client").
+              It handles ALL user interactions: creating, editing,
+              deleting notes. The server component renders the static
+              shell, then hands off interactivity to this client component. */}
           <NotesClient />
         </div>
       </div>
@@ -462,93 +598,169 @@ This is an **async Server Component** — it can directly `await connectDB()`. T
 
 ```tsx
 // components/NotesClient.tsx (key patterns extracted)
+
+// "use client" MUST be the very first line (before any imports).
+// It tells Next.js: "This component runs in the browser."
+// Without it, useState/useEffect/onClick would cause errors because
+// those features only work in the browser, not on the server.
 "use client";
+
 import React, { useState, useEffect } from "react";
+// react-hot-toast gives us toast.success() and toast.error() to show
+// popup notifications. It's a browser-only library (needs DOM access).
 import toast from "react-hot-toast";
 
+// TypeScript interface — defines the exact shape of a Note object.
+// This matches what MongoDB returns via our Mongoose model.
 interface Note {
-  _id: string; // MongoDB's auto-generated ID
+  _id: string; // MongoDB auto-generates a unique _id for every document
   title: string;
   content: string;
-  createdAt: string;
+  createdAt: string; // ISO date string (e.g., "2024-01-15T10:30:00.000Z")
   updatedAt: string;
 }
 
 const NotesClient = () => {
-  // --- State Management ---
+  // ═══════════════════════════════════════════════════
+  // STATE MANAGEMENT — each useState creates a reactive variable.
+  // When the value changes, React re-renders the component.
+  // ═══════════════════════════════════════════════════
+
+  // The list of all notes. <Note[]> tells TypeScript it's an array of Note objects.
   const [notes, setNotes] = useState<Note[]>([]);
-  const [loading, setLoading] = useState(true); // Initial load spinner
-  const [isSubmitting, setIsSubmitting] = useState(false); // Prevents double-submit
+
+  // true while the initial fetch is happening → shows a "Loading..." message.
+  const [loading, setLoading] = useState(true);
+
+  // true while a create/update request is in-flight → disables the submit button
+  // to prevent the user from clicking multiple times (double-submit protection).
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Controlled form inputs for the "Create Note" form.
+  // React controls the input value (not the DOM), so we always know the current value.
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
-  const [editingId, setEditingId] = useState<string | null>(null); // Which note is being edited
+
+  // Which note is currently being edited? null = none.
+  // When set to a note's _id, that note's card switches from "read mode" to "edit mode".
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [editContent, setEditContent] = useState("");
-  const [deletingId, setDeletingId] = useState<string | null>(null); // Which note is being deleted
 
-  // Fetch on mount
+  // Which note is currently being deleted? null = none.
+  // Used to show "Deleting..." only on the specific card being deleted.
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // ═══════════════════════════════════════════════════
+  // FETCH ON MOUNT
+  // ═══════════════════════════════════════════════════
+  // useEffect with an empty dependency array [] runs ONCE when the component
+  // first mounts (appears on screen). It's the React equivalent of
+  // "when the page loads, do this."
   useEffect(() => {
-    fetchNotes();
-  }, []);
+    fetchNotes(); // Call our API to get all notes from MongoDB
+  }, []); // [] = no dependencies = run only once, not on every re-render
 
-  // --- API Interaction Patterns ---
-
-  // CREATE
+  // ═══════════════════════════════════════════════════
+  // CREATE — POST /api/notes
+  // ═══════════════════════════════════════════════════
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    // e.preventDefault() stops the browser from reloading the page.
+    // By default, submitting a <form> triggers a full page reload.
+    // We want to handle the submission with JavaScript instead.
     e.preventDefault();
+
+    // Client-side validation: .trim() removes whitespace.
+    // If the user typed only spaces, treat it as empty.
     if (!title.trim() || !content.trim()) {
       toast.error("Title and content are required");
-      return;
+      return; // Stop here — don't send an empty request
     }
-    setIsSubmitting(true);
+
+    setIsSubmitting(true); // Disable the button while request is in-flight
+
     try {
+      // fetch() sends an HTTP request to our Route Handler.
+      // "/api/notes" is a RELATIVE URL — the browser prepends the current domain.
       const response = await fetch("/api/notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, content }),
+        method: "POST", // HTTP method
+        headers: { "Content-Type": "application/json" }, // Tell the server we're sending JSON
+        body: JSON.stringify({ title, content }), // Convert JS object to JSON string
       });
+
+      // Parse the JSON response body.
       const data = await response.json();
+
       if (data.success) {
-        setNotes((prev) => [data.note, ...prev]); // Prepend new note
+        // FUNCTIONAL STATE UPDATE: use the callback form (prev => ...) to get
+        // the most current state. [data.note, ...prev] PREPENDS the new note
+        // to the beginning of the array (newest appears first).
+        setNotes((prev) => [data.note, ...prev]);
+
+        // Clear the form inputs after successful creation.
         setTitle("");
         setContent("");
+
         toast.success("Note created successfully!");
       }
     } catch (error) {
+      // Network error, server down, etc.
       toast.error("Error creating note.");
     } finally {
+      // 'finally' runs whether the try succeeded or the catch caught an error.
+      // This guarantees the button is re-enabled no matter what happens.
       setIsSubmitting(false);
     }
   };
 
-  // UPDATE (Optimistic-like pattern)
+  // ═══════════════════════════════════════════════════
+  // UPDATE — PATCH /api/notes/:id
+  // ═══════════════════════════════════════════════════
   const handleUpdate = async (noteId: string) => {
-    // ... validation ...
+    // ... validation omitted for brevity ...
+
+    // Template literal: `backtick string with ${variable}` lets us embed
+    // the noteId directly into the URL.
     const response = await fetch(`/api/notes/${noteId}`, {
-      method: "PATCH",
+      method: "PATCH", // PATCH = partial update (only change specified fields)
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: editTitle, content: editContent }),
     });
+
     const data = await response.json();
+
     if (data.success) {
+      // Update the note in local state WITHOUT re-fetching from the server.
+      // .map() creates a new array where ONLY the matching note is replaced.
       setNotes((prev) =>
-        prev.map((note) =>
-          note._id === noteId
-            ? { ...note, title: editTitle, content: editContent }
-            : note,
+        prev.map(
+          (note) =>
+            note._id === noteId
+              ? // Spread operator: { ...note } copies all fields, then we
+                // override title and content with the edited values.
+                { ...note, title: editTitle, content: editContent }
+              : note, // All other notes stay unchanged
         ),
       );
     }
   };
 
-  // DELETE
+  // ═══════════════════════════════════════════════════
+  // DELETE — DELETE /api/notes/:id
+  // ═══════════════════════════════════════════════════
   const handleDelete = async (noteId: string) => {
+    // Track which specific note is being deleted (for per-card loading state).
     setDeletingId(noteId);
+
     const response = await fetch(`/api/notes/${noteId}`, {
-      method: "DELETE",
+      method: "DELETE", // No body needed — the ID in the URL is enough
     });
+
     const data = await response.json();
+
     if (data.success) {
+      // .filter() creates a new array containing every note EXCEPT the
+      // one with the matching _id. This removes it from the UI instantly.
       setNotes((prev) => prev.filter((note) => note._id !== noteId));
     }
   };
@@ -582,20 +794,38 @@ const NotesClient = () => {
 
 ```tsx
 // components/ToasterProvider.tsx
+
+// "use client" — required because react-hot-toast uses browser APIs
+// (DOM manipulation, setTimeout for auto-dismiss, etc.)
 "use client";
+
+// Toaster is the CONTAINER component that renders toast notifications.
+// The actual toast.success() / toast.error() calls happen elsewhere,
+// but the Toaster component MUST be rendered somewhere for them to appear.
 import { Toaster } from "react-hot-toast";
 
 export default function ToasterProvider() {
   return (
     <Toaster
-      position="top-right"
-      reverseOrder={false}
-      gutter={8}
+      position="top-right" // Where on the screen toasts appear
+      reverseOrder={false} // false = newest toast on top, true = newest at bottom
+      gutter={8} // Gap (in pixels) between stacked toasts
       toastOptions={{
-        duration: 4000,
-        style: { background: "#363636", color: "#fff" },
-        success: { duration: 3000, style: { background: "#10b981" } },
-        error: { duration: 4000, style: { background: "#ef4444" } },
+        // Default settings for ALL toast types:
+        duration: 4000, // Auto-dismiss after 4 seconds (4000ms)
+        style: {
+          background: "#363636", // Dark gray background
+          color: "#fff", // White text
+        },
+        // Override defaults for specific toast types:
+        success: {
+          duration: 3000, // Success toasts dismiss faster (3s)
+          style: { background: "#10b981" }, // Green (Tailwind's emerald-500)
+        },
+        error: {
+          duration: 4000, // Error toasts stay longer (4s)
+          style: { background: "#ef4444" }, // Red (Tailwind's red-500)
+        },
       }}
     />
   );
